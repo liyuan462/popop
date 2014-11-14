@@ -1,0 +1,329 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+ 
+import sys, os, time, atexit
+import signal
+import socket
+import errno
+import threading
+import datetime
+from gi.repository import Notify
+from optparse import OptionParser
+
+
+# this daemon implementation borrows from 
+# [http://www.jejik.com/articles/2007/02/a_simple_unix_linux_daemon_in_python/]
+class Daemon(object):
+    """
+    A generic daemon class.
+       
+    Usage: subclass the Daemon class and override the run() method
+    """
+    def __init__(self, pidfile, stdin='/dev/null', 
+                 stdout='/dev/null', stderr='/dev/null'):
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pidfile = pidfile
+
+            
+    def daemonize(self):
+        """
+        do the UNIX double-fork magic, see Stevens' "Advanced
+        Programming in the UNIX Environment" for details (ISBN 0201563177)
+        http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+        """
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit first parent
+                sys.exit(0)
+        except OSError, e:
+            sys.stderr.write("fork #1 failed: %d (%s)\n" % (
+                e.errno, e.strerror))
+            sys.exit(1)
+                        
+        # decouple from parent environment
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
+                
+        # do second fork
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit from second parent
+                sys.exit(0)
+        except OSError, e:
+            sys.stderr.write("fork #2 failed: %d (%s)\n" % (
+                e.errno, e.strerror))
+            sys.exit(1)
+                        
+        # redirect standard file descriptors
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = file(self.stdin, 'r')
+        so = file(self.stdout, 'a+')
+        se = file(self.stderr, 'a+', 0)
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+                
+        # write pidfile
+        atexit.register(self.delpid)
+        signal.signal(signal.SIGTERM, term_handler)
+        pid = str(os.getpid())
+        file(self.pidfile,'w+').write("%s\n" % pid)
+
+                
+    def delpid(self):
+        os.remove(self.pidfile)
+
+            
+    def start(self):
+        """
+        Start the daemon
+        """
+        # Check for a pidfile to see if the daemon already runs
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError, e:
+            if e.errno == errno.EACCES:
+                raise
+            pid = None
+                    
+        if pid:
+            message = "pidfile %s already exist. Daemon already running?\n"
+            sys.stderr.write(message % self.pidfile)
+            sys.exit(1)
+
+        # Check if we can write the pidfile
+        pf = file(self.pidfile,'w')
+        pf.close()
+        os.remove(self.pidfile)
+
+        self.before_daemonize()
+        # Start the daemon
+        self.daemonize()
+        self.run()
+
+                
+    def stop(self):
+        """
+        Stop the daemon
+        """
+        # Get the pid from the pidfile
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError, e:
+            if e.errno == errno.EACCES:
+                raise
+            pid = None
+                    
+        if not pid:
+            message = "pidfile %s does not exist. Daemon not running?\n"\
+                      "Or maybe you forget to specify the pid file with which you start?\n"
+            sys.stderr.write(message % self.pidfile)
+            return # not an error in a restart
+                    
+        # Try killing the daemon process       
+        try:
+            while 1:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.1)
+        except OSError, err:
+            err = str(err)
+            if err.find("No such process") > 0:
+                if os.path.exists(self.pidfile):
+                    os.remove(self.pidfile)
+            else:
+                print str(err)
+                sys.exit(1)
+
+                                
+    def restart(self):
+        """
+        Restart the daemon
+        """
+        self.stop()
+        self.start()
+
+
+    def status(self):
+        try:
+            pf = file(self.pidfile,'r')
+            pid = int(pf.read().strip())
+            pf.close()
+        except IOError:
+            pid = None
+                    
+        if pid:
+            message = "popop is running ... \n"
+        else:
+            message = "popop is NOT running.\nOr maybe you forget to "\
+                      "specify the pid file with which you start?\n"
+        sys.stderr.write(message)
+
+
+    def before_daemonize(self):
+        """
+        Give a chance to let a subclass to do something 
+        before it enters to daemon.
+        """
+
+
+    def run(self):
+        """
+        You should override this method when you subclass Daemon. 
+        It will be called after the process has been daemonized 
+        by start() or restart().
+        """
+        
+
+
+class MyDaemon(Daemon):
+    def __init__(self, pidfile, port, stdin='/dev/null', 
+                 stdout='/dev/null', stderr='/dev/null'):
+        super(MyDaemon, self).__init__(pidfile, stdin, stdout, stderr)
+        self.port = port
+
+    
+    def before_daemonize(self):
+        Notify.init("popop")
+        serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        serversocket.bind(('', self.port))
+        serversocket.listen(5)        
+        self._serversocket = serversocket
+
+
+    def run(self):
+        while 1:
+            (clientsocket, address) = self._serversocket.accept()
+            ct = client_thread(clientsocket)
+            ct.start()
+
+
+
+class mysocket(object):
+    def __init__(self, sock=None):
+        if sock is None:
+            self.sock = socket.socket(
+                socket.AF_INET, socket.SOCK_STREAM)
+        else:
+            self.sock = sock
+
+
+    def receive(self):
+        return self.sock.recv(1024)
+
+
+    def close(self):
+        self.sock.close()
+
+
+
+class client_thread(threading.Thread):
+    last_time = None
+    last_message = None
+    lock = threading.Lock()
+
+    def __init__(self, sock):
+        super(client_thread, self).__init__()
+        self.sock = mysocket(sock)
+
+
+    def run(self):
+        message = self.sock.receive().decode('gbk').encode('utf8')
+        self.sock.close()
+
+        self.__class__.lock.acquire()
+        if self._filter(message):
+            self.__class__.lock.release()
+            return
+        sys.stderr.write(datetime.datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S") + ": " + message + '\n')
+        self.__class__.last_time = datetime.datetime.now()
+        self.__class__.last_message = message
+        self.__class__.lock.release()
+        message = Notify.Notification.new(
+            "主人，您有了新的泡泡消息", message, "dialog-information")
+        message.show()
+
+
+    def _filter(self, message):
+        last_message = self.__class__.last_message
+        last_time = self.__class__.last_time
+        if last_message is None:
+            return False
+        if last_message != message:
+            return False
+        if last_time is None:
+            return False
+        now = datetime.datetime.now()
+        if last_time + datetime.timedelta(seconds=30) > now:
+            return True
+        return False
+
+
+def cmd_run(opts):
+    Notify.init("popop")
+
+    serversocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serversocket.bind(('', opts.port))
+    serversocket.listen(5)
+
+    while 1:
+        (clientsocket, address) = serversocket.accept()
+        ct = client_thread(clientsocket)
+        ct.start()
+
+
+def term_handler(signum, frame):
+    pass
+
+
+if __name__ == '__main__':
+    parser = OptionParser(
+        usage="usage: %prog [options] [daemon start|stop|restart|status]")
+    parser.add_option(
+        "-p", "--port", dest="port", type="int", 
+        help="specify the port", default=12345)
+    parser.add_option(
+        "-i", "--pid", dest="pid", 
+        help="specify the pid file path, this is "
+        "useful when you run in daemon mode", default="/var/tmp/popopd.pid")
+    parser.add_option(
+        "-l", "--log", dest="log", 
+        help="specify the log file path, this is "
+        "useful when you run in daemon mode", default="/tmp/popopd.log")
+    opts, args = parser.parse_args()
+
+    if len(args) == 0:
+        cmd_run(opts)
+        sys.exit(0)
+
+    if len(args) != 2:
+        parser.print_help()
+        sys.exit(1)
+
+    if args[0] != 'daemon':
+        parser.print_help()
+        sys.exit(1)
+
+    daemon = MyDaemon(opts.pid, opts.port, stderr=opts.log)
+    action = args[1]
+    if action == 'start':
+        daemon.start()
+    elif action == 'stop':
+        daemon.stop()
+    elif action == 'restart':
+        daemon.restart()
+    elif action == 'status':
+        daemon.status()
+    else:
+        parser.print_help()
+        sys.exit(1)
